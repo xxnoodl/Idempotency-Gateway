@@ -1,0 +1,19 @@
+{
+  "name": "idempotency-gateway",
+  "version": "1.0.0",
+  "description": "Idempotency layer for payment processing — ensures payments are charged exactly once",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  }
+}
