@@ -1,74 +1,56 @@
 # Idempotency Gateway
+This is a payment processing API that makes sure every transaction is charged exactly once despite how many times a client retries a request.
 
-A payment-processing API that makes sure every transaction is charged **exactly once** regardless of how many times the client retries a request.
-
-Built with **Node.js**, **Express**, and **SQLite**
-
----
-
-## Architecture Diagram
+## The Architecture Diagram
 
 ```mermaid
 sequenceDiagram
     participant C as Client
-    participant M as Idempotency Middleware
-    participant DB as SQLite Store
-    participant P as Payment Processor
+    participant IM as Idempotency Middleware 
+    participant SS as SQLite Store
+    participant PP as Payment Processor
 
-    C->>M: POST /process-payment<br/>Idempotency-Key: abc-123
+    C ->> IM: POST /process-payment<br/> Idempotency-Key: abc; IM ->> SS: SELECT record WHERE key = 'abc'; 
+    SS -->> IM: (key not found)
+    
+    IM ->> SS: INSERT key='abc', status='pending'
+    IM ->> PP: forward request
+    Note over PP: simulate 2s processing
+    PP -->> IM: {message: "Charged 10 GHS", ...}
+    IM ->> SS: UPDATE key = 'abc', status='complete',...
+    IM -->> C: 201 Created + response body
 
-    M->>DB: SELECT record WHERE key = 'abc-123'
-    DB-->>M: (not found)
-
-    M->>DB: INSERT key='abc-123', status='pending'
-    M->>P: forward request
-
-    Note over P: simulate 2s processing
-
-    P-->>M: { message: "Charged 100 GHS", transactionId: ... }
-    M->>DB: UPDATE key='abc-123', status='complete', response=...
-    M-->>C: 201 Created + response body
-
-    Note over C,P: --- Client retries (network timeout) ---
-
-    C->>M: POST /process-payment<br/>Idempotency-Key: abc-123 (same body)
-    M->>DB: SELECT record WHERE key = 'abc-123'
-    DB-->>M: { status: 'complete', response: ... }
-    M-->>C: 201 Created + cached response body<br/>X-Cache-Hit: true
+    Note over C,PP: Client retries (network timeout)
+    
+    C ->> IM: POST /process-payment<br/>Idempotency-Key: abc (same body)
+    IM ->> SS: SELECT record WHERE key = 'abc'
+    SS -->> IM: {status: 'complete, ...}
+    IM -->> C: cached response<br/>X-Cached-Hit: true
 ```
-
 ### In-Flight Race Condition
 
 ```mermaid
 sequenceDiagram
     participant A as Request A
     participant B as Request B
-    participant M as Middleware
-    participant DB as SQLite Store
-    participant P as Payment Processor
+    participant IM as Idempotency Middleware
+    participant SS as SQLite Store
+    participant PP as Payment Processor
+    
+    A ->> IM: POST (key: xyz); IM ->> SS: INSERT key = 'xyz', status='pending' [Request A wins]
+    B ->> IM: POST (key: xyz) arrives at the same time; IM ->> SS: INSERT key = 'xyz', [already pending]
+    A ->> PP: forward to processor
 
-    A->>M: POST (key: xyz)
-    B->>M: POST (key: xyz) — arrives simultaneously
+    Note over B,SS: Request B polls DB every 100ms
 
-    M->>DB: INSERT key='xyz', status='pending' [Request A wins]
-    M->>DB: INSERT key='xyz' [Request B: 0 rows changed → already pending]
+    PP -->>A: payment result
+    A ->> SS: UPDATE status='complete'
 
-    A->>P: forward to processor
-    Note over B,DB: Request B polls DB every 100ms
+    SS -->> B: status='complete' (poll succeeds)
+    B -->> B: return cached result
 
-    P-->>A: payment result
-    A->>DB: UPDATE status='complete'
-
-    DB-->>B: status='complete' (poll succeeds)
-    B-->>B: return cached result
 ```
-
----
-
 ## Setup
-
-**Requirements:** Node.js v22.5.0 or later (uses the built-in `node:sqlite` module).
-
 ```bash
 git clone https://github.com/xxnoodl/Idempotency-Gateway.git
 cd Idempotency-Gateway
@@ -76,156 +58,98 @@ npm install
 npm start
 ```
 
-The server starts on `http://localhost:3000` by default.  
-Set the `PORT` environment variable to use a different port:
-
-```bash
-PORT=8080 npm start
-```
-
----
+The server starts on `localhost:3000` by default
 
 ## API Documentation
 
 ### `POST /process-payment`
 
-Process a payment. Protected by idempotency — the same key always returns the same result.
-
 **Headers**
 
-| Header            | Required | Description                                         |
-|-------------------|----------|-----------------------------------------------------|
-| `Content-Type`    | Yes      | Must be `application/json`                          |
-| `Idempotency-Key` | Yes      | A unique string identifying this payment attempt    |
+| Header | Required | Description|
+|-|-|-|
+| `Content-Type` | Yes | Must be `application/json` |
+|`Idempotency-Key` | Yes | A unique string identifying payment attempt|
 
 **Request Body**
 
 ```json
 {
-  "amount": 100,
-  "currency": "GHS"
+    "amount": 100,
+    "currency": "GHS"
 }
 ```
-
-| Field      | Type   | Description                     |
-|------------|--------|---------------------------------|
-| `amount`   | number | Positive number — amount to charge |
-| `currency` | string | ISO currency code (e.g. `GHS`)  |
-
----
 
 ### Response Reference
-
-#### `201 Created` — Payment processed (first request)
-
-```json
-{
-  "message": "Charged 100 GHS",
-  "transactionId": "f3c91f5d-4f45-42a0-a041-db9f2d4fe8ee",
-  "timestamp": "2026-05-30T04:24:41.817Z"
-}
-```
-
-#### `201 Created` — Replayed response (duplicate request)
-
-Same body as the first response. Includes the header:
-
-```
-X-Cache-Hit: true
-```
-
-No processing delay — returned immediately from the store.
-
-#### `409 Conflict` — Key reused with a different request body
+#### `201 Created`: payment processed
 
 ```json
 {
-  "error": "Idempotency key already used for a different request body."
+    "message": "Charged 100 GHS",
+    "transactionId":"49295a7e-2c73-4629-9461-5eba8acaa910",
+    "timestamp":"2026-05-30T10:45:53.385Z"
 }
 ```
+#### `201 Created`: replayed response (duplicate request)
+Same body as first response, Includes the header: `X-Cache-Hit: true`
+No processing delay, returned immediately.
 
-#### `400 Bad Request` — Missing `Idempotency-Key` header
-
+#### `409 Conflict`: key reused with different request body
 ```json
-{
-  "error": "Missing required header: Idempotency-Key"
-}
-```
 
----
+{"error":"Idempotency key already used for a different request body."}
+```
+#### 400 Bad Request: Missing `Idempotency-Key` header
+```json
+{"error":"Missing required header: Idempotency-Key"}
+``` 
 
 ### Example: curl
-
 **First request**
-```bash
-curl -X POST http://localhost:3000/process-payment \
-  -H "Content-Type: application/json" \
-  -H "Idempotency-Key: order-7829-attempt-1" \
-  -d '{"amount": 100, "currency": "GHS"}'
-```
 
-**Retry (same key, same body)**
 ```bash
 curl -i -X POST http://localhost:3000/process-payment \
-  -H "Content-Type: application/json" \
-  -H "Idempotency-Key: order-7829-attempt-1" \
-  -d '{"amount": 100, "currency": "GHS"}'
-# Response headers will include: X-Cache-Hit: true
+-H "Content-Type: application/json" \
+-H "Idempotency-Key: abc" \
+-d '{"amount": 100, "currency": "GHS"}'
 ```
 
-**Conflict (same key, different body)**
+
+**Second request (same key, same body)**
 ```bash
-curl -X POST http://localhost:3000/process-payment \
-  -H "Content-Type: application/json" \
-  -H "Idempotency-Key: order-7829-attempt-1" \
-  -d '{"amount": 500, "currency": "GHS"}'
-# → 409 Conflict
+curl -i -X POST http://localhost:3000/process-payment \
+-H "Content-Type: application/json" \
+-H "Idempotency-Key: abc" \
+-d '{"amount": 100, "currency": "GHS"}'
 ```
 
----
-
+**conflict (same key, different body)**
+```bash
+curl -i -X POST http://localhost:3000/process-payment \
+-H "Content-Type: application/json" \
+-H "Idempotency-Key: abc" \
+-d '{"amount": 500, "currency": "GHS"}'
+```
 ## Design Decisions
+**SQLite via `node:sqlite`**
+Node.js v22.5+ ships with native SQLite module. Using it avoid any native complication step. The server starts with `npm install && npm start` on any supported Node version, with no build tools needed.
 
-### SQLite via `node:sqlite` (built-in)
-
-Node.js v22.5+ ships a native SQLite module (`node:sqlite`). Using it avoids any native compilation step — the server starts with `npm install && npm start` on any supported Node version, with no build tools required.
-
-SQLite runs in WAL (Write-Ahead Logging) mode for better concurrent-read performance.
+SQLiet runs in WAL mode for better concurrent-read performance.
 
 ### Request Body Hashing
-
-Idempotency requires detecting when two requests share a key but carry different payloads. The body is hashed with SHA-256 after canonicalising the JSON (keys sorted alphabetically), so `{"a":1,"b":2}` and `{"b":2,"a":1}` are treated as identical.
+Idempotency requires detecting when two requests share a key but carry different payloads. The body is hashed with SHA-256 after standardizing the JSON.
 
 ### In-Flight Race Condition
+The store uses a `status` column with two states: `pending` (being processed) and `complete`. 
+When a request arrives, it attempts `INSERT OR IGNORE`. If `changes = 1`, it won the race and owns processing. If `changes = 0`, anothe request is already in-flight. This request polls the DB every 100ms up to 30s until `status = 'complete'`, then returns the cached result.
+SQLite serializes all writes so there's no window for two requests to both see `changes = 1`.
 
-The store uses a `status` column with two states: `pending` (being processed) and `complete`. When a request arrives:
+## Developer's Choice: Idempotency Key Expiration (24 hour TTL)
 
-1. It attempts `INSERT OR IGNORE` — if `changes = 1`, it won the race and owns processing.
-2. If `changes = 0`, another request is already in-flight. This request polls the DB every 100 ms (up to 30 s) until `status = 'complete'`, then returns the cached result.
+## What it does
+Every key written to the store is stamped with an  `expires_at` timestamp that is set to 24 hours from when it was created.
+keys that expire are filted out all lookups and purged from the database on startup and once per hour via a background interval.
 
-Because SQLite serialises all writes, there is no window for two requests to both see `changes = 1`.
-
-### Response Interception
-
-Rather than duplicating response logic between the route and the middleware, the middleware wraps `res.json()` before calling `next()`. The route handler runs normally; the wrapper intercepts the response body and status code, persists them to the store, and then forwards to the original `res.json`.
-
----
-
-## Developer's Choice: Idempotency Key Expiration (24-hour TTL)
-
-### What it does
-
-Every key written to the store is stamped with an `expires_at` timestamp set to **24 hours from creation**. Expired keys are:
-
-- Filtered out of all lookups (treated as if they never existed).
-- Purged from the database on startup and once per hour via a background interval.
-
-### Why it matters
-
-Without expiry, idempotency keys accumulate forever — a memory/disk leak in disguise. More critically, in a real Fintech environment:
-
-- **Replay attacks**: A malicious or buggy client could re-submit a key weeks later and expect the old response to be honoured. A TTL ensures keys can only be replayed within a sensible window.
-- **Compliance**: Payment regulations often require that retry windows are bounded (e.g., PCI-DSS guidance on reconciliation windows).
-- **Operational hygiene**: The store size stays bounded without any manual intervention.
-
-The 24-hour window is a common industry default (Stripe uses 24 hours). It can be adjusted by changing the `TTL_SECONDS` constant in `src/db.js`.
+## Importance
+Without expiry, idempotency keys accumulate forever; that's a memory leak in disguise.
+In a real life fintech environment, this could pose dangers like replay attacks. Furthemore, it is good for compliance and operational hygiene (the store size stays bounded without any manual intervention).
